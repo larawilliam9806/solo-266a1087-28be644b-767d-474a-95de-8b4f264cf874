@@ -2,23 +2,31 @@
 
 Endpoints
 ---------
-``POST /archive``            submit (or atomically replace) one period's batch
-``GET  /archive/{period}``   batch metadata
-``POST /census/query``       minimal-read expression + union population
+``POST /archive``                          submit (or atomically replace) one period's batch
+``GET  /archive/{period}``                 batch metadata
+``POST /census/query``                     minimal-read expression + union population
+``GET  /archive/{period}/partition/check`` validate the mutually-exclusive partition table
+``GET  /archive/{period}/partition.csv``   download the partition base table as CSV
 
 The census endpoint works in two clearly separated phases inside one SQLite
 read snapshot: first derive the expression from the period's catalog only, then
 read headcounts for exactly the cells that appear in the expression.
+
+The partition export validates the whole batch and streams the CSV inside one
+SQLite read snapshot, so the check and the download always describe the same
+batch even while another client replaces the period wholesale.
 """
 
 from __future__ import annotations
 
 import os
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from .archive import (
@@ -29,6 +37,7 @@ from .archive import (
     UnknownPeriod,
     validate_cell,
 )
+from .partition import PartitionConflict, emit_partition_csv, validate_partition
 from .solver import MAX_DEPTH, analyze
 
 MAX_CELLS_PER_REQUEST = 100_000
@@ -124,6 +133,15 @@ class MissingArchiveResponse(BaseModel):
     truncated: bool = False
 
 
+class PartitionCheckResponse(BaseModel):
+    period: str
+    ok: bool
+    cell_count: int
+    row_count: int
+    total_population: int
+    created_at: str
+
+
 app = FastAPI(
     title="Census Archive Service",
     description=(
@@ -151,6 +169,24 @@ async def _missing_cells_handler(request: Request, exc: MissingCells) -> JSONRes
             "period": exc.period,
             "missing_blocks": list(exc.cells),
             "truncated": False,
+        },
+    )
+
+
+@app.exception_handler(PartitionConflict)
+async def _partition_conflict_handler(
+    request: Request, exc: PartitionConflict
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": str(exc),
+            "period": exc.period,
+            "cell": exc.cell,
+            "population": exc.population,
+            "deducted_population": exc.deducted_population,
+            "remaining": exc.remaining,
+            "fully_tiled": exc.fully_tiled,
         },
     )
 
@@ -197,6 +233,63 @@ def read_batch(period: str, archive: Archive = Depends(get_archive)) -> BatchRes
         created_at=info.created_at,
         replaced=False,
     )
+
+
+@app.get("/archive/{period}/partition/check", response_model=PartitionCheckResponse)
+def check_partition(
+    period: str, archive: Archive = Depends(get_archive)
+) -> PartitionCheckResponse:
+    """Validate the partition table without downloading it.
+
+    ``total_population`` is the sum of the ``remaining`` column the CSV
+    would carry, i.e. the population of the union of all stored cells.
+    """
+    with archive.snapshot(period) as snapshot:
+        stats = validate_partition(snapshot)
+        return PartitionCheckResponse(
+            period=period,
+            ok=True,
+            cell_count=stats.cell_count,
+            row_count=stats.row_count,
+            total_population=stats.total_population,
+            created_at=snapshot.created_at,
+        )
+
+
+@app.get("/archive/{period}/partition.csv")
+def download_partition(
+    period: str, archive: Archive = Depends(get_archive)
+) -> StreamingResponse:
+    """Stream the mutually-exclusive partition base table as CSV.
+
+    Validation and streaming share one SQLite read snapshot, so the CSV is
+    checked against exactly the batch it is generated from; a conflicting
+    batch yields ``409`` and no CSV at all.  The snapshot never blocks a
+    concurrent wholesale replacement of the period.
+    """
+    stack = ExitStack()
+    snapshot = stack.enter_context(archive.snapshot(period))
+    try:
+        validate_partition(snapshot)
+    except BaseException:
+        stack.close()
+        raise
+
+    def stream():
+        try:
+            yield from emit_partition_csv(snapshot)
+        finally:
+            stack.close()
+
+    filename = quote(f"partition-{period}.csv")
+    headers = {
+        "Content-Disposition": (
+            f"attachment; filename=\"partition.csv\"; filename*=UTF-8''{filename}"
+        ),
+        # Batch version, identical to the check endpoint's created_at.
+        "X-Batch-Created-At": snapshot.created_at,
+    }
+    return StreamingResponse(stream(), media_type="text/csv", headers=headers)
 
 
 @app.post("/census/query", response_model=CensusResponse)

@@ -38,6 +38,8 @@ pytest -q
 | `POST` | `/archive` | 整批交存/换交 |
 | `GET` | `/archive/{period}` | 批次元数据 |
 | `POST` | `/census/query` | 求覆盖并集人数 + 最简算式 |
+| `GET` | `/archive/{period}/partition/check` | 核对互斥分区底表（不下载） |
+| `GET` | `/archive/{period}/partition.csv` | 下载互斥分区底表 CSV |
 | `GET` | `/healthz` | 健康检查 |
 
 ### 交存
@@ -80,6 +82,37 @@ curl -X POST localhost:8000/census/query -H 'content-type: application/json' -d 
 - 算式**与人口分布无关**：对任意把人数分配到最细格的方案，算式恒等于目标区域人数。
 - 目录与人数读自同一 SQLite 读事务（`snapshot`），并发换交也不会混批。
 - 无解（请求区域没有可覆盖的档案）时返回 `422` 并列出 `missing_blocks`，提示缺档。
+
+### 互斥分区底表（CSV 导出）
+
+档案里大格套细格，直接加总会重复计数。按统计期导出**互斥分区底表**，统计工具逐行加总即可：
+
+```bash
+curl -OJ localhost:8000/archive/2024/partition.csv   # 下载
+curl localhost:8000/archive/2024/partition/check     # 只核对不下载
+```
+
+```csv
+cell,deducted,remaining
+,"[""0""]",60
+0,"[""00""]",30
+00,[],10
+```
+
+- 每个已存格扣除它的**最近已存后代格**（与它之间没有其他已存格的后代格），
+  一行输出：格号、扣除格号的 JSON 数组、余下人数。
+- 余下区域即使碎成几块也只出一行，人数不拆分；所有行的余下区域两两不相交，
+  逐行加总 `remaining` 就是全部已存格并集的人数（`check` 返回的 `total_population`）。
+- 后代格**铺满**时，人数合计必须等于上级格人数，该格的空区域行省略不出；
+  合计不等即冲突。
+- 有空档时余下人数为负也算冲突。
+- 发现冲突返回 `409` 并指出格号（`cell` 字段），**整份 CSV 不发出**。
+- 核对与下载在同一个 SQLite 读快照内完成，用的是同一批档案；`check` 的
+  `created_at` 与 CSV 响应头 `X-Batch-Created-At` 是批次版本，可用来核对两次
+  请求是否看到同一批。导出期间该期仍可整批换交（WAL 读写互不阻塞），
+  进行中的导出始终看到换交前的那一批。
+- 导出**不展开最细格**（铺满判定用 `4^k` 细格数算术），也不把整期人数或完整
+   CSV 装进内存：全程游标逐行扫描、逐块输出，内存占用以网格深度为界。
 
 ## 求解器
 

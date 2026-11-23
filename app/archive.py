@@ -246,11 +246,11 @@ class Archive:
             conn.executescript(_SCHEMA)
             conn.execute("BEGIN")
             row = conn.execute(
-                "SELECT 1 FROM batches WHERE period = ?", (period,)
+                "SELECT created_at FROM batches WHERE period = ?", (period,)
             ).fetchone()
             if row is None:
                 raise UnknownPeriod(period)
-            yield BatchSnapshot(conn, period)
+            yield BatchSnapshot(conn, period, created_at=row["created_at"])
             conn.execute("COMMIT")
         except BaseException:
             try:
@@ -265,9 +265,14 @@ class Archive:
 class BatchSnapshot:
     """Read-only consistent view of one period used by the solver."""
 
-    def __init__(self, conn: sqlite3.Connection, period: str) -> None:
+    def __init__(
+        self, conn: sqlite3.Connection, period: str, created_at: str = ""
+    ) -> None:
         self._conn = conn
         self.period = period
+        # Batch version: changes on every wholesale replacement, so clients
+        # can tell whether two requests saw the same batch.
+        self.created_at = created_at
 
     def catalog(self) -> List[str]:
         rows = self._conn.execute(
@@ -283,6 +288,35 @@ class BatchSnapshot:
         found = _fetch_populations(self._conn, self.period, wanted)
         _require_all(self.period, wanted, found)
         return found
+
+    def iter_cells(self) -> Iterator[Tuple[str, int]]:
+        """Stream every stored ``(cell, population)`` in id order.
+
+        The cursor is consumed lazily, so the whole period is never loaded
+        into memory at once.
+        """
+        cursor = self._conn.execute(
+            "SELECT cell, population FROM cells WHERE period = ? ORDER BY cell",
+            (self.period,),
+        )
+        for row in cursor:
+            yield row["cell"], row["population"]
+
+    def iter_descendants(self, cell: str) -> Iterator[Tuple[str, int]]:
+        """Stream the strict stored descendants of ``cell`` in id order.
+
+        Descendants are exactly the stored ids in the half-open range
+        ``(cell, cell + "4")``: every id below ``cell`` starts with ``cell``
+        followed by digits 0-3.  Uses the primary-key index; rows are
+        consumed lazily.
+        """
+        cursor = self._conn.execute(
+            "SELECT cell, population FROM cells "
+            "WHERE period = ? AND cell > ? AND cell < ? ORDER BY cell",
+            (self.period, cell, cell + "4"),
+        )
+        for row in cursor:
+            yield row["cell"], row["population"]
 
 
 def _fetch_populations(
